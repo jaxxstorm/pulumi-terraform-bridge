@@ -13,12 +13,12 @@ require (
 	github.com/hashicorp/terraform-plugin-sdk v1.7.0
 	github.com/mitchellh/copystructure v1.0.0
 	github.com/pkg/errors v0.9.1
-	github.com/pulumi/pulumi/pkg/v2 v2.2.2-0.20200519081838-f66100ce28b0
+	github.com/pulumi/pulumi/pkg/v2 v2.5.1-0.20200702005738-443f0c8c978f
 	github.com/pulumi/pulumi/sdk/v2 v2.2.2-0.20200519081838-f66100ce28b0
 	github.com/pulumi/tf2pulumi v0.8.1-0.20200519092335-cb56a4dfa88d
 	github.com/spf13/afero v1.2.2
 	github.com/spf13/cobra v1.0.0
-	github.com/stretchr/testify v1.5.1
+	github.com/stretchr/testify v1.6.1
 	golang.org/x/mod v0.2.0
 	golang.org/x/net v0.0.0-20200301022130-244492dfa37a
 	google.golang.org/grpc v1.28.0
