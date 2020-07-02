@@ -1168,6 +1168,7 @@ type npmPackage struct {
 
 type npmPulumiManifest struct {
 	Resource bool `json:"resource,omitempty"`
+	ProviderURL string `json:"providerURL,omitempty"`
 }
 
 func (g *nodeJSGenerator) emitNPMPackageMetadata(pack *pkg) error {
@@ -1211,6 +1212,7 @@ func (g *nodeJSGenerator) emitNPMPackageMetadata(pack *pkg) error {
 		DevDependencies: devDependencies,
 		Pulumi: npmPulumiManifest{
 			Resource: true,
+			ProviderURL: g.info.ProviderURL,
 		},
 	}
 

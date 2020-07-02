@@ -43,6 +43,7 @@ type ProviderInfo struct {
 	LogoURL           string                            // an optional URL to the logo of the package
 	Homepage          string                            // the URL to the project homepage.
 	Repository        string                            // the URL to the project source code repository.
+	ProviderURL       string							// an optional URL to download the provider binary from.
 	Version           string                            // the version of the provider package.
 	Config            map[string]*SchemaInfo            // a map of TF name to config schema overrides.
 	ExtraConfig       map[string]*ConfigInfo            // a list of Pulumi-only configuration variables.
