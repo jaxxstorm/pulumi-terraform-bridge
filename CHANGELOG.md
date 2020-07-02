@@ -3,6 +3,25 @@ CHANGELOG
 
 ## HEAD (Unreleased)
 
+- Convert examples using the current schema.
+  [#224](https://github.com/pulumi/pulumi-terraform-bridge/pull/224)
+  
+- Add check against empty assets.
+  [#223](https://github.com/pulumi/pulumi-terraform-bridge/pull/223)
+
+- Add support for generating Go examples.
+  [#194](https://github.com/pulumi/pulumi-terraform-bridge/pull/218)
+  
+- Add JSON path links to properties when generating doc comments and deprecation messages for
+  a Pulumi schema.
+  [#202](https://github.com/pulumi/pulumi-terraform-bridge/pull/202)
+
+- Update README generation for python. 
+  [#217](https://github.com/pulumi/pulumi-terraform-bridge/pull/217)
+
+- Use the schema-based code generator for NodeJS.
+  [#194](https://github.com/pulumi/pulumi-terraform-bridge/pull/194)
+
 - Allow providers to define additional object types in the schema.
   [#192](https://github.com/pulumi/pulumi-terraform-bridge/pull/192)
 

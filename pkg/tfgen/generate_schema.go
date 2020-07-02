@@ -22,11 +22,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/gedex/inflector"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
-	"github.com/pkg/errors"
+	"github.com/pulumi/pulumi/pkg/v2/codegen"
 	pschema "github.com/pulumi/pulumi/pkg/v2/codegen/schema"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/util/contract"
@@ -38,44 +39,15 @@ type schemaGenerator struct {
 	pkg     string
 	version string
 	info    tfbridge.ProviderInfo
-	outDir  string
-}
-
-// newSchemaGenerator returns a language generator that understands how to produce Pulumi schemas.
-func newSchemaGenerator(pkg, version string, info tfbridge.ProviderInfo, outDir string) langGenerator {
-	return &schemaGenerator{
-		pkg:     pkg,
-		version: version,
-		info:    info,
-		outDir:  outDir,
-	}
-}
-
-func (g *schemaGenerator) emitPackage(pack *pkg) error {
-	spec, err := g.genPackageSpec(pack)
-	if err != nil {
-		return errors.Wrap(err, "generating Pulumi schema")
-	}
-
-	spec.Version = ""
-	schema, err := json.MarshalIndent(spec, "", "    ")
-	if err != nil {
-		return errors.Wrap(err, "marshaling Pulumi schema")
-	}
-
-	if err := emitFile(g.outDir, "schema.json", schema); err != nil {
-		return errors.Wrap(err, "emitting schema.json")
-	}
-	return nil
-}
-
-func (g *schemaGenerator) typeName(r *resourceType) string {
-	return r.name
 }
 
 type schemaNestedType struct {
-	typ       *propertyType
-	pyMapCase bool
+	typ             *propertyType
+	declarer        declarer
+	required        codegen.StringSet
+	requiredInputs  codegen.StringSet
+	requiredOutputs codegen.StringSet
+	pyMapCase       bool
 }
 
 type schemaNestedTypes struct {
@@ -103,16 +75,16 @@ func gatherSchemaNestedTypesForMember(member moduleMember) map[string]*schemaNes
 func (nt *schemaNestedTypes) gatherFromMember(member moduleMember) {
 	switch member := member.(type) {
 	case *resourceType:
-		nt.gatherFromProperties(member, member.name, "", member.inprops, true)
-		nt.gatherFromProperties(member, member.name, "", member.outprops, true)
+		nt.gatherFromProperties(member, member.name, member.inprops, true, true)
+		nt.gatherFromProperties(member, member.name, member.outprops, false, true)
 		if !member.IsProvider() {
-			nt.gatherFromProperties(member, member.name, "", member.statet.properties, true)
+			nt.gatherFromProperties(member, member.name, member.statet.properties, true, true)
 		}
 	case *resourceFunc:
-		nt.gatherFromProperties(member, member.name, "", member.args, true)
-		nt.gatherFromProperties(member, member.name, "", member.rets, true)
+		nt.gatherFromProperties(member, member.name, member.args, true, true)
+		nt.gatherFromProperties(member, member.name, member.rets, false, true)
 	case *variable:
-		nt.gatherFromPropertyType(member, member.name, "", "", member.typ, true)
+		nt.gatherFromPropertyType(member, member.name, "", member.typ, false, true)
 	}
 }
 
@@ -121,25 +93,61 @@ type declarer interface {
 }
 
 func (nt *schemaNestedTypes) declareType(
-	declarer declarer, namePrefix, name, nameSuffix string, typ *propertyType, pyMapCase bool) string {
+	declarer declarer, namePrefix, name string, typ *propertyType, isInput, pyMapCase bool) string {
 
 	// Generate a name for this nested type.
-	baseName := namePrefix + strings.Title(name)
+	typeName := namePrefix + strings.Title(name)
 
 	// Override the nested type name, if necessary.
 	if typ.nestedType.Name().String() != "" {
-		baseName = typ.nestedType.Name().String()
+		typeName = typ.nestedType.Name().String()
 	}
 
-	typeName := baseName + strings.Title(nameSuffix)
 	typ.name = typeName
 
-	nt.nameToType[typeName] = &schemaNestedType{typ: typ, pyMapCase: pyMapCase}
-	return baseName
+	required := codegen.StringSet{}
+	for _, p := range typ.properties {
+		if !p.optional() {
+			required.Add(p.name)
+		}
+	}
+
+	var requiredInputs, requiredOutputs codegen.StringSet
+	if isInput {
+		requiredInputs = required
+	} else {
+		requiredOutputs = required
+	}
+
+	if existing, ok := nt.nameToType[typeName]; ok {
+		contract.Assert(existing.declarer == declarer || existing.typ.equals(typ))
+
+		// For output type conflicts, record the output type's required properties. These will be attached to
+		// a nodejs-specific blob in the object type's spec s.t. the node code generator can generate code that matches
+		// the code produced by the old tfgen code generator.
+		if isInput {
+			existing.requiredInputs = requiredInputs
+		} else {
+			existing.requiredOutputs = requiredOutputs
+		}
+
+		existing.typ, existing.required = typ, required
+		return typeName
+	}
+
+	nt.nameToType[typeName] = &schemaNestedType{
+		typ:             typ,
+		declarer:        declarer,
+		required:        required,
+		requiredInputs:  requiredInputs,
+		requiredOutputs: requiredOutputs,
+		pyMapCase:       pyMapCase,
+	}
+	return typeName
 }
 
-func (nt *schemaNestedTypes) gatherFromProperties(declarer declarer, namePrefix, nameSuffix string, ps []*variable,
-	pyMapCase bool) {
+func (nt *schemaNestedTypes) gatherFromProperties(declarer declarer, namePrefix string, ps []*variable,
+	isInput, pyMapCase bool) {
 
 	for _, p := range ps {
 		name := p.name
@@ -151,21 +159,21 @@ func (nt *schemaNestedTypes) gatherFromProperties(declarer declarer, namePrefix,
 		// properties an object-typed element that are not Map types. This is consistent with the earlier behavior. See
 		// https://github.com/pulumi/pulumi/issues/3151 for more details.
 		mapCase := pyMapCase && p.typ.kind == kindObject && p.schema.Type == schema.TypeMap
-		nt.gatherFromPropertyType(declarer, namePrefix, name, nameSuffix, p.typ, mapCase)
+		nt.gatherFromPropertyType(declarer, namePrefix, name, p.typ, isInput, mapCase)
 	}
 }
 
-func (nt *schemaNestedTypes) gatherFromPropertyType(
-	declarer declarer, namePrefix, name, nameSuffix string, typ *propertyType, pyMapCase bool) {
+func (nt *schemaNestedTypes) gatherFromPropertyType(declarer declarer, namePrefix, name string, typ *propertyType,
+	isInput, pyMapCase bool) {
 
 	switch typ.kind {
 	case kindList, kindSet, kindMap:
 		if typ.element != nil {
-			nt.gatherFromPropertyType(declarer, namePrefix, name, nameSuffix, typ.element, pyMapCase)
+			nt.gatherFromPropertyType(declarer, namePrefix, name, typ.element, isInput, pyMapCase)
 		}
 	case kindObject:
-		baseName := nt.declareType(declarer, namePrefix, name, nameSuffix, typ, pyMapCase)
-		nt.gatherFromProperties(declarer, baseName, nameSuffix, typ.properties, pyMapCase)
+		baseName := nt.declareType(declarer, namePrefix, name, typ, isInput, pyMapCase)
+		nt.gatherFromProperties(declarer, baseName, typ.properties, isInput, pyMapCase)
 	}
 }
 
@@ -175,17 +183,13 @@ func rawMessage(v interface{}) json.RawMessage {
 	return json.RawMessage(bytes)
 }
 
-func genPulumiSchema(pack *pkg, name, version string, info tfbridge.ProviderInfo) (*pschema.Package, error) {
+func genPulumiSchema(pack *pkg, name, version string, info tfbridge.ProviderInfo) (pschema.PackageSpec, error) {
 	g := &schemaGenerator{
 		pkg:     name,
 		version: version,
 		info:    info,
 	}
-	spec, err := g.genPackageSpec(pack)
-	if err != nil {
-		return nil, err
-	}
-	return pschema.ImportSpec(spec, nil)
+	return g.genPackageSpec(pack)
 }
 
 func (g *schemaGenerator) genPackageSpec(pack *pkg) (pschema.PackageSpec, error) {
@@ -251,21 +255,30 @@ func (g *schemaGenerator) genPackageSpec(pack *pkg) (pschema.PackageSpec, error)
 		spec.Types[token] = typ
 	}
 
+	downstreamLicense := g.info.GetTFProviderLicense()
+	licenseTypeURL := getLicenseTypeURL(downstreamLicense)
+	readme := fmt.Sprintf(
+		standardDocReadme, g.pkg, g.info.Name, g.info.GetGitHubOrg(), downstreamLicense, licenseTypeURL)
+	nodeData := map[string]interface{}{
+		"readme":                  readme,
+		"disableUnionOutputTypes": true,
+	}
 	if jsi := g.info.JavaScript; jsi != nil {
-		spec.Language["nodejs"] = rawMessage(map[string]interface{}{
-			"packageName":        jsi.PackageName,
-			"packageDescription": generateManifestDescription(g.info),
-			"dependencies":       jsi.Dependencies,
-			"devDependencies":    jsi.DevDependencies,
-			"typescriptVersion":  jsi.TypeScriptVersion,
-		})
+		nodeData["packageName"] = jsi.PackageName
+		nodeData["packageDescription"] = generateManifestDescription(g.info)
+		nodeData["dependencies"] = jsi.Dependencies
+		nodeData["devDependencies"] = jsi.DevDependencies
+		nodeData["typescriptVersion"] = jsi.TypeScriptVersion
 	}
+	spec.Language["nodejs"] = rawMessage(nodeData)
 
-	if pi := g.info.Python; pi != nil {
-		spec.Language["python"] = rawMessage(map[string]interface{}{
-			"requires": pi.Requires,
-		})
+	pythonData := map[string]interface{}{
+		"readme": readme,
 	}
+	if pi := g.info.Python; pi != nil {
+		pythonData["requires"] = pi.Requires
+	}
+	spec.Language["python"] = rawMessage(pythonData)
 
 	if csi := g.info.CSharp; csi != nil {
 		spec.Language["csharp"] = rawMessage(map[string]interface{}{
@@ -454,6 +467,18 @@ func (g *schemaGenerator) genDatasourceFunc(mod string, fun *resourceFunc) psche
 	return spec
 }
 
+func setEquals(a, b codegen.StringSet) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b.Has(k) {
+			return false
+		}
+	}
+	return true
+}
+
 func (g *schemaGenerator) genObjectType(mod string, typInfo *schemaNestedType) (string, pschema.ObjectTypeSpec) {
 	typ := typInfo.typ
 	contract.Assert(typ.kind == kindObject)
@@ -481,7 +506,45 @@ func (g *schemaGenerator) genObjectType(mod string, typInfo *schemaNestedType) (
 		}
 	}
 
+	nodeInfo := map[string]interface{}{}
+	if !setEquals(typInfo.required, typInfo.requiredInputs) {
+		requiredInputs := make([]string, 0, len(typInfo.requiredInputs))
+		for name := range typInfo.requiredInputs {
+			requiredInputs = append(requiredInputs, name)
+		}
+		sort.Strings(requiredInputs)
+		nodeInfo["requiredInputs"] = requiredInputs
+	}
+	if !setEquals(typInfo.required, typInfo.requiredOutputs) {
+		requiredOutputs := make([]string, 0, len(typInfo.requiredOutputs))
+		for name := range typInfo.requiredOutputs {
+			requiredOutputs = append(requiredOutputs, name)
+		}
+		sort.Strings(requiredOutputs)
+		nodeInfo["requiredOutputs"] = requiredOutputs
+	}
+	if len(nodeInfo) != 0 {
+		spec.Language = map[string]json.RawMessage{
+			"nodejs": rawMessage(nodeInfo),
+		}
+	}
+
 	return token, spec
+}
+
+func (g *schemaGenerator) schemaPrimitiveType(k typeKind) string {
+	switch k {
+	case kindBool:
+		return "boolean"
+	case kindInt:
+		return "integer"
+	case kindFloat:
+		return "number"
+	case kindString:
+		return "string"
+	default:
+		return ""
+	}
 }
 
 func (g *schemaGenerator) schemaType(mod string, typ *propertyType, out bool) pschema.TypeSpec {
@@ -490,6 +553,9 @@ func (g *schemaGenerator) schemaType(mod string, typ *propertyType, out bool) ps
 	case typ == nil:
 		return pschema.TypeSpec{Ref: "pulumi.json#/Any"}
 	case typ.typ != "" || len(typ.altTypes) != 0:
+		// Compute the default type for the union. May be empty.
+		defaultType := g.schemaPrimitiveType(typ.kind)
+
 		var toks []tokens.Type
 		if typ.typ != "" {
 			toks = []tokens.Type{typ.typ}
@@ -508,16 +574,9 @@ func (g *schemaGenerator) schemaType(mod string, typ *propertyType, out bool) ps
 				if pkg == g.pkg {
 					pkg = ""
 				}
-				spec := pschema.TypeSpec{Ref: fmt.Sprintf("%s#/types/%s", pkg, strings.TrimSuffix(string(t), "[]"))}
-				switch typ.kind {
-				case kindBool:
-					spec.Type = "boolean"
-				case kindInt:
-					spec.Type = "integer"
-				case kindFloat:
-					spec.Type = "number"
-				case kindString:
-					spec.Type = "string"
+				spec := pschema.TypeSpec{
+					Type: defaultType,
+					Ref:  fmt.Sprintf("%s#/types/%s", pkg, strings.TrimSuffix(string(t), "[]")),
 				}
 				if strings.HasSuffix(string(t), "[]") {
 					items := spec
@@ -529,7 +588,10 @@ func (g *schemaGenerator) schemaType(mod string, typ *propertyType, out bool) ps
 		if len(typs) == 1 {
 			return typs[0]
 		}
-		return pschema.TypeSpec{OneOf: typs}
+		return pschema.TypeSpec{
+			Type:  defaultType,
+			OneOf: typs,
+		}
 	case typ.asset != nil:
 		if typ.asset.IsArchive() {
 			return pschema.TypeSpec{Ref: "pulumi.json#/Archive"}
@@ -539,14 +601,10 @@ func (g *schemaGenerator) schemaType(mod string, typ *propertyType, out bool) ps
 
 	// First figure out the raw type.
 	switch typ.kind {
-	case kindBool:
-		return pschema.TypeSpec{Type: "boolean"}
-	case kindInt:
-		return pschema.TypeSpec{Type: "integer"}
-	case kindFloat:
-		return pschema.TypeSpec{Type: "number"}
-	case kindString:
-		return pschema.TypeSpec{Type: "string"}
+	case kindBool, kindInt, kindFloat, kindString:
+		t := g.schemaPrimitiveType(typ.kind)
+		contract.Assert(t != "")
+		return pschema.TypeSpec{Type: t}
 	case kindSet, kindList:
 		items := g.schemaType(mod, typ.element, out)
 		return pschema.TypeSpec{Type: "array", Items: &items}
@@ -559,4 +617,64 @@ func (g *schemaGenerator) schemaType(mod string, typ *propertyType, out bool) ps
 		contract.Failf("Unrecognized type kind: %v", typ.kind)
 		return pschema.TypeSpec{}
 	}
+}
+
+func (g *generator) convertExamplesInPropertySpec(spec pschema.PropertySpec) pschema.PropertySpec {
+	spec.Description = g.convertExamples(spec.Description, false)
+	spec.DeprecationMessage = g.convertExamples(spec.DeprecationMessage, false)
+	return spec
+}
+
+func (g *generator) convertExamplesInObjectSpec(spec pschema.ObjectTypeSpec) pschema.ObjectTypeSpec {
+	spec.Description = g.convertExamples(spec.Description, false)
+	for name, prop := range spec.Properties {
+		spec.Properties[name] = g.convertExamplesInPropertySpec(prop)
+	}
+	return spec
+}
+
+func (g *generator) convertExamplesInResourceSpec(spec pschema.ResourceSpec) pschema.ResourceSpec {
+	spec.Description = g.convertExamples(spec.Description, true)
+	spec.DeprecationMessage = g.convertExamples(spec.DeprecationMessage, false)
+	for name, prop := range spec.Properties {
+		spec.Properties[name] = g.convertExamplesInPropertySpec(prop)
+	}
+	for name, prop := range spec.InputProperties {
+		spec.InputProperties[name] = g.convertExamplesInPropertySpec(prop)
+	}
+	if spec.StateInputs != nil {
+		stateInputs := g.convertExamplesInObjectSpec(*spec.StateInputs)
+		spec.StateInputs = &stateInputs
+	}
+	return spec
+}
+
+func (g *generator) convertExamplesInFunctionSpec(spec pschema.FunctionSpec) pschema.FunctionSpec {
+	spec.Description = g.convertExamples(spec.Description, true)
+	if spec.Inputs != nil {
+		inputs := g.convertExamplesInObjectSpec(*spec.Inputs)
+		spec.Inputs = &inputs
+	}
+	if spec.Outputs != nil {
+		outputs := g.convertExamplesInObjectSpec(*spec.Outputs)
+		spec.Outputs = &outputs
+	}
+	return spec
+}
+
+func (g *generator) convertExamplesInSchema(spec pschema.PackageSpec) pschema.PackageSpec {
+	for name, variable := range spec.Config.Variables {
+		spec.Config.Variables[name] = g.convertExamplesInPropertySpec(variable)
+	}
+	for token, object := range spec.Types {
+		spec.Types[token] = g.convertExamplesInObjectSpec(object)
+	}
+	spec.Provider = g.convertExamplesInResourceSpec(spec.Provider)
+	for token, resource := range spec.Resources {
+		spec.Resources[token] = g.convertExamplesInResourceSpec(resource)
+	}
+	for token, function := range spec.Functions {
+		spec.Functions[token] = g.convertExamplesInFunctionSpec(function)
+	}
+	return spec
 }
